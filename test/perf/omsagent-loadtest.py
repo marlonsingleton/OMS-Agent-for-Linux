@@ -45,6 +45,19 @@ plugins_config_format = {
          dummy {"message":"in_dummy %(dummy_event)s"}
        </source>
    """,
+    'in_oms_syslog': """
+        <source>
+          type oms_syslog
+          log_level %(log_level)s
+          path %(syslog_path)s
+          protocol_type unix
+          delimiter %(syslog_delimiter)s
+          tag oms.syslog
+        </source>
+        <filter oms.syslog.**>
+          type filter_syslog
+        </filter>
+        """,
     'in_syslog': """
         <source>
           type syslog
@@ -52,6 +65,7 @@ plugins_config_format = {
           port %(syslog_port)s
           bind %(syslog_host)s
           protocol_type %(syslog_protocol)s
+          delimiter %(syslog_delimiter)s
           tag oms.syslog
         </source>
         <filter oms.syslog.**>
@@ -255,7 +269,7 @@ def get_threads_cpu_percent(p, total_percent):
     return threads
 
 
-def measure(process, cpu_interval=0.1):
+def measure(process, cpu_interval=0):
     result = dict()
     result['cpu'] = process.cpu_percent(cpu_interval)
     mem = vars(process.memory_info())
@@ -282,7 +296,7 @@ def find_children_processes(processes):
     return list(set(processes))
 
 
-def profile(processes, profiler, cpu_interval=0.1):
+def profile(processes, profiler, cpu_interval=0):
     terminated_processes = []
     for process in processes:
         try:
@@ -296,7 +310,7 @@ def profile(processes, profiler, cpu_interval=0.1):
             profiler[key]['cpu'].append(result['cpu'])
             profiler[key]['mem'].append(result['rss'] / 10 ** 6)
             # profiler[key]['minor_flt'].append(result['minor_flt'])
-            # profiler[key]['major_flt'].append(result['major_flt'])
+            profiler[key]['major_flt'].append(result['major_flt'])
 
             for tid, value in get_threads_cpu_percent(process, result['cpu']).iteritems():
                 if tid not in profiler[key]['threads']:
@@ -474,14 +488,18 @@ class MySysLogHandler(SysLogHandler):
 class SyslogWriter(OutputWriter):
     def __init__(self, tag, path, msg_size, protocol="udp"):
         OutputWriter.__init__(self, 'in_syslog', tag, path, msg_size)
-        self.host, port = self.path.split(':')
-        self.port = int(port)
+        self.host = None
+        self.port = None
+        self.is_unix_socket = (protocol.lower() == 'unix')
+        if not self.is_unix_socket:
+            self.host, port = self.path.split(':')
+            self.port = int(port)
         self.protocol = protocol
         self.logger = None
         self.include_counter = True
 
     def get_address(self):
-        return self.host, self.port
+        return self.path if self.is_unix_socket else (self.host, self.port)
 
     def get_protocol(self):
         return self.protocol
@@ -499,6 +517,8 @@ class SyslogWriter(OutputWriter):
                 socktype = socket.SOCK_STREAM
             elif self.protocol.lower() == 'udp':
                 socktype = socket.SOCK_DGRAM
+            elif self.protocol.lower() == 'unix':
+                socktype = socket.SOCK_STREAM
 
             self.logger = logging.getLogger('omstest')
             self.logger.setLevel(logging.INFO)
@@ -507,6 +527,8 @@ class SyslogWriter(OutputWriter):
 
     def get_number_dropped_event(self):
         dropped_events = 0
+        if self.is_unix_socket:
+            return 0
         list_conn = net_connections(self.protocol)
         for conn in list_conn:
             addr = conn['laddr']
@@ -523,6 +545,7 @@ class SyslogWriter(OutputWriter):
         for i in range(eps):
             msg = 'idx=%d %s %s' % (self.index, self.get_name(), self.msg) if self.include_counter else self.msg
             msg += '\n'
+            # print(msg)
             logger.log(logging.INFO, msg)
             self.index += 1
 
@@ -541,12 +564,15 @@ class CEFWriter(SyslogWriter):
         syslog_handler.setFormatter(CEFFormatter())
         return syslog_handler
 
-
 class TcpWriter(SyslogWriter):
     def __init__(self, tag, path, msg_size):
         SyslogWriter.__init__(self, tag, path, msg_size, 'tcp')
         self.name = 'in_tcp'
 
+class SyslogOMSWriter(SyslogWriter):
+    def __init__(self, tag, path, msg_size, protocol):
+        SyslogWriter.__init__(self, tag, path, msg_size, protocol)
+        self.name = 'in_oms_syslog'
 
 class ProcessWrapper:
     def __init__(self, cmd_fmt, cmd_args):
@@ -570,8 +596,12 @@ class ConfigManager:
 
         self.tag = constants['tag']
         self.constants = constants
-        self.SYSLOG_PATH = '%(syslog_host)s:%(syslog_port)s' % constants
-        self.SECURITY_PATH = '%(syslog_host)s:%(security_events_port)s' % constants
+        if constants['syslog_protocol'] == 'unix':
+            self.SYSLOG_PATH = '%(syslog_path)s' % constants
+            self.SECURITY_PATH = '%(syslog_path)s' % constants
+        else:
+            self.SYSLOG_PATH = '%(syslog_host)s:%(syslog_port)s' % constants
+            self.SECURITY_PATH = '%(syslog_host)s:%(security_events_port)s' % constants
         self.FLUENT_PATH = '%(fluent_host)s:%(fluent_port)s' % constants
         self.TAIL_PATH = '%(tail_path)s' % constants
         self.TESTING_FOLDER_PATH = constants['test_dir']
@@ -580,10 +610,11 @@ class ConfigManager:
 
         self.available_writers = [
             SyslogWriter(self.tag, self.SYSLOG_PATH, self.event_size, constants['syslog_protocol']),
+            SyslogOMSWriter(self.tag, '%(syslog_path)s' % constants, self.event_size, 'unix'),
             CEFWriter(self.tag, self.SECURITY_PATH, self.event_size, constants['syslog_protocol']),
             TailFileWriter(self.tag, self.TAIL_PATH, self.event_size),
             ForwardWriter(self.tag, self.FLUENT_PATH, self.event_size),
-            TcpWriter(self.tag, self.SYSLOG_PATH, self.event_size)
+            # TcpWriter(self.tag, self.SYSLOG_PATH, self.event_size)
         ]
 
     def get_writers_by_name(self, names):
@@ -835,19 +866,22 @@ WORKSPACE_DIR = './workspace'
 TEST_DIR = os.path.join(WORKSPACE_DIR, 'test_dir')
 RUBY_PATH_OMS = "/opt/microsoft/omsagent/ruby/bin/ruby"
 RUBY_PATH_DEFAULT = "/usr/bin/ruby"
-RUBY_PATH_LOCAL = "/usr/local/bin/ruby --jit"
+RUBY_PATH_LOCAL = "/usr/local/bin/ruby"
 RUBY_PROF_PATH = "/usr/local/bin/ruby-prof"
 DEFAULT_VARS = {
     'tag': 'oms.tag.perf',
     'dummy_rate': '1',
-    'log_level': 'debug',
+    'log_level': 'trace',
     'ruby_path': RUBY_PATH_OMS,
+    'ruby_params': '',
     'nb_out_threads': '5',
     'CEF_format': '/^(?<time>(?:\w+ +){2,3}(?:\d+:){2}\d+):? ?(?:(?<host>[^: ]+) ?:?)? (?<ident>[a-zA-Z0-9_%\/\.\-]*)(?:\[(?<pid>[0-9]+)\])?: *(?<message>.*)$/',
     'syslog_port': '25224',
     'security_events_port': '25226',
-    'syslog_host': '127.0.0.1',
+    'syslog_path': '%s/in_syslog.socket' % TEST_DIR,
+    'syslog_host': '0.0.0.0',
     'syslog_protocol': 'tcp',
+    'syslog_delimiter': r'"\n"',
     'fluent_port': '24224',
     'fluent_host': '0.0.0.0',
     'retry_limit': '50',
@@ -864,9 +898,9 @@ DEFAULT_VARS = {
     'omsagent_path': '/opt/microsoft/omsagent/bin/omsagent',
     'result_path': '%s/results.csv' % WORKSPACE_DIR,
     'wait_time_after_completion': '5',
-    'tail_read_from_head': 'true',
+    'tail_read_from_head': 'false',
     'perf_tuning': 'none',
-    'event_size': '1000',
+    'event_size': '1',
     'network_queue': '21299',
 }
 
@@ -912,8 +946,9 @@ def main(argv):
     parser.add_argument("--sample-rate", required=False, type=float, help="sampling rate in seconds", default=0.5)
     parser.add_argument("--pids", required=False, help="pids of processes to collect metrics", default='')
     parser.add_argument("--pgrep", required=False, help="process name to collect metrics", default='')
-    parser.add_argument("--rubyprof", required=False, type=bool, help="enable cpu profiling", default=False)
-    parser.add_argument("--stackprof", required=False, type=bool, help="enable cpu profiling", default=False)
+    parser.add_argument("--rubyprof", help="enable cpu profiling with ruby-prof", action='store_true')
+    parser.add_argument("--stackprof", help="enable cpu profiling with stackprof", action='store_true')
+    parser.add_argument("--jit", help="enable ruby JIT compilation", action='store_true')
     parser.add_argument("--plugins", required=False,
                         help="choose which plugins to enable, available plugins: %s" % ','.join(get_all_plugins_name()),
                         default='')
@@ -937,6 +972,10 @@ def main(argv):
 
     rubyprof = args['rubyprof']
     stackprof = args['stackprof']
+
+    if args['jit']:
+        DEFAULT_VARS['ruby_params'] = DEFAULT_VARS['ruby_params'] + '--jit '
+
     eps = args['eps']
     DEFAULT_VARS['dummy_eps'] = str(eps)
     run_time = args['run_time']
@@ -958,7 +997,8 @@ def main(argv):
         if not any(plugins):
             raise Exception("No plugin was provided: plz use --plugins arguments to set input and output plugins")
         environments = {}
-        cmd_fmt = "%(ruby_path)s %(omsagent_path)s --no-supervisor -c %(omsagent_config_path)s -o %(omsagent_output_path)s"
+
+        cmd_fmt = "%(ruby_path)s %(ruby_params)s%(omsagent_path)s --no-supervisor -c %(omsagent_config_path)s -o %(omsagent_output_path)s"
         if rubyprof:
             os.system('mkdir -p ./omsperf')
             cmd_fmt = "/usr/local/bin/ruby-prof --mode=cpu -p multi --file=./omsperf %(omsagent_path)s -- --no-supervisor -c %(omsagent_config_path)s -o %(omsagent_output_path)s"
@@ -972,7 +1012,7 @@ def main(argv):
 
         run_cmds(oms_setups_cmds)
         config_mgr.create_oms_config_file(plugins)
-        print("CMD:%s" % proc.get_cmd())
+        print("CMD: %s" % proc.get_cmd())
         pids = [proc.start_process(envs=environments)]
 
     plugin_names = '|'.join(plugins)
@@ -985,14 +1025,9 @@ def main(argv):
     profiling, response_times, nb_events = loadbench.run_load(eps, processes, writers)
     wait_time_after_completion = int(config_mgr.constants['wait_time_after_completion'])
     if spawn_new_process:
-        # Gracefully terminate processes
-        for proc in processes:
-            if proc.is_running():
-                proc.send_signal(psutil.signal.SIGTERM)
-
         elapsed_time = 0.0
-        if wait_time_after_completion > run_time:
-            wait_time_after_completion = run_time / 2
+        # if wait_time_after_completion > run_time:
+        #     wait_time_after_completion = run_time / 2
 
         print("Waiting %d seconds after completion" % wait_time_after_completion)
         while elapsed_time < wait_time_after_completion:
@@ -1000,6 +1035,12 @@ def main(argv):
             loadbench.save_test_status('wait_time_after_completion', elapsed_time, profiling)
             time.sleep(5)
             elapsed_time += (time.time() - begin_time)
+
+        # Gracefully terminate processes
+        for proc in processes:
+            if proc.is_running():
+                proc.send_signal(psutil.signal.SIGTERM)
+        time.sleep(5)
         # cleanup created process
         os.system(("sudo kill -9 %s" % ' '.join(map(str, pids))))
     else:
